@@ -27,7 +27,7 @@ switch ($action) {
         $mobile_number = $request['mobile_number'] ?? ''; $password = $request['password'] ?? '';
         if(empty($mobile_number) || empty($password)) { echo json_encode(['status' => 'error', 'message' => 'Credentials required.']); exit; }
         try {
-            $stmt = $pdo->prepare("SELECT id, branch_id, role, name, password, status FROM users WHERE mobile_number = ? LIMIT 1");
+            $stmt = $pdo->prepare("SELECT id, branch_id, role, name, password, status, feature_permissions FROM users WHERE mobile_number = ? LIMIT 1");
             $stmt->execute([$mobile_number]);
             $user = $stmt->fetch();
             if ($user && password_verify($password, $user['password'])) {
@@ -63,29 +63,186 @@ switch ($action) {
         catch(PDOException $e) { echo json_encode(['status' => 'error', 'message' => 'Fetch failed.']); }
         break;
 
+    // --- UPGRADED: EMPLOYEE FORGE INCLUDES DEPARTMENT & WEEK OFF ---
     case 'create_user':
         $role = $request['role'] ?? 'staff';
         $branch_id = ($role === 'admin') ? null : ($request['branch_id'] ?? null);
-        $name = $request['name'] ?? ''; $mobile_number = $request['mobile_number'] ?? ''; $password = $request['password'] ?? '';
-        $salary = $request['salary'] ?? 0; // Added salary parameter for registration
-        if(empty($name) || empty($mobile_number) || empty($password)) { echo json_encode(['status' => 'error', 'message' => 'All fields required.']); exit; }
+        $name = $request['name'] ?? ''; 
+        $mobile_number = $request['mobile_number'] ?? ''; 
+        $password = $request['password'] ?? '';
+        $department = $request['department'] ?? '';
+        
+        $salary = $request['salary'] ?? 0; 
+        $paid_leaves = $request['paid_leaves'] ?? 0;
+        $shift_hours = $request['shift_hours'] ?? 9;
+        $week_off_day = $request['week_off_day'] ?? 'Sunday';
+        $permissions = json_encode($request['permissions'] ?? []);
+
+        if(empty($name) || empty($mobile_number) || empty($password)) { echo json_encode(['status' => 'error', 'message' => 'Identity fields required.']); exit; }
+        
         try {
             $hashed_password = password_hash($password, PASSWORD_DEFAULT);
             $pdo->beginTransaction();
-            $pdo->prepare("INSERT INTO users (branch_id, role, name, mobile_number, password) VALUES (?, ?, ?, ?, ?)")->execute([$branch_id, $role, $name, $mobile_number, $hashed_password]);
+            
+            $stmt = $pdo->prepare("INSERT INTO users (branch_id, role, department, name, mobile_number, password, feature_permissions) VALUES (?, ?, ?, ?, ?, ?, ?)");
+            $stmt->execute([$branch_id, $role, $department, $name, $mobile_number, $hashed_password, $permissions]);
             $new_user_id = $pdo->lastInsertId();
-            $pdo->prepare("INSERT INTO employee_contracts (user_id, monthly_fixed_salary) VALUES (?, ?)")->execute([$new_user_id, $salary]);
+            
+            $contract_stmt = $pdo->prepare("INSERT INTO employee_contracts (user_id, monthly_fixed_salary, monthly_paid_leaves, standard_shift_hours, week_off_day) VALUES (?, ?, ?, ?, ?)");
+            $contract_stmt->execute([$new_user_id, $salary, $paid_leaves, $shift_hours, $week_off_day]);
+            
             log_action($pdo, $request['admin_id'] ?? null, $branch_id, 'USER_CREATED', "New $role ($name) registered.");
             $pdo->commit();
-            echo json_encode(['status' => 'success', 'message' => 'Employee registered.']);
+            echo json_encode(['status' => 'success', 'message' => 'Personnel deployed successfully.']);
         } catch(PDOException $e) {
-            $pdo->rollBack(); echo json_encode(['status' => 'error', 'message' => ($e->getCode() == 23000) ? 'Mobile exists.' : 'Creation failed.']);
+            $pdo->rollBack(); echo json_encode(['status' => 'error', 'message' => ($e->getCode() == 23000) ? 'Mobile already exists.' : 'Creation failed.']);
         }
         break;
 
-    case 'get_users':
-        try { echo json_encode(['status' => 'success', 'data' => $pdo->query("SELECT u.id, u.name, u.role, u.mobile_number, u.status, b.branch_name, c.monthly_fixed_salary FROM users u LEFT JOIN branches b ON u.branch_id = b.id LEFT JOIN employee_contracts c ON u.id = c.user_id ORDER BY u.id DESC")->fetchAll()]); } 
-        catch(PDOException $e) { echo json_encode(['status' => 'error', 'message' => 'Fetch failed.']); }
+    case 'get_branch_master':
+        $branch_id = $request['branch_id'] ?? null;
+        if(!$branch_id) { echo json_encode(['status'=>'error','message'=>'Branch ID required']); exit; }
+        try {
+            $b_stmt = $pdo->prepare("SELECT * FROM branches WHERE id = ?");
+            $b_stmt->execute([$branch_id]);
+            $branch = $b_stmt->fetch();
+
+            $s_stmt = $pdo->prepare("
+                SELECT u.id, u.name, u.role, u.department, u.mobile_number, u.status, u.feature_permissions,
+                       c.monthly_fixed_salary, c.monthly_paid_leaves, c.standard_shift_hours, c.week_off_day
+                FROM users u LEFT JOIN employee_contracts c ON u.id = c.user_id
+                WHERE u.branch_id = ? ORDER BY u.role ASC, u.name ASC
+            ");
+            $s_stmt->execute([$branch_id]);
+            $staff = $s_stmt->fetchAll();
+            foreach($staff as &$s) { $s['feature_permissions'] = json_decode($s['feature_permissions'] ?? '[]', true); }
+
+            $p_stmt = $pdo->prepare("
+                SELECT u.name, p.punch_time FROM attendance_punches p
+                JOIN users u ON p.user_id = u.id WHERE u.branch_id = ? AND DATE(p.punch_time) = ?
+                ORDER BY p.punch_time DESC LIMIT 20
+            ");
+            $p_stmt->execute([$branch_id, date('Y-m-d')]);
+            $recent_punches = $p_stmt->fetchAll();
+
+            echo json_encode(['status' => 'success', 'data' => ['branch' => $branch, 'staff' => $staff, 'recent_punches' => $recent_punches]]);
+        } catch(PDOException $e) { echo json_encode(['status' => 'error', 'message' => 'Failed to load branch matrix.']); }
+        break;
+
+    // --- UPGRADED: AUTOMATED F/H/A SPREADSHEET ENGINE ---
+    case 'get_monthly_attendance':
+        $branch_id = $request['branch_id'] ?? null;
+        $month = $request['month'] ?? date('m');
+        $year = $request['year'] ?? date('Y');
+        if(!$branch_id) { echo json_encode(['status'=>'error','message'=>'Branch ID required']); exit; }
+        
+        try {
+            // 1. Get Staff and Shift Targets
+            $staff_stmt = $pdo->prepare("
+                SELECT u.id, u.name, u.department, c.standard_shift_hours, c.week_off_day 
+                FROM users u LEFT JOIN employee_contracts c ON u.id = c.user_id 
+                WHERE u.branch_id = ? AND u.status = 'active' ORDER BY u.name ASC
+            ");
+            $staff_stmt->execute([$branch_id]);
+            $staff = $staff_stmt->fetchAll();
+
+            // 2. Get All Punches for the Month
+            $punches_stmt = $pdo->prepare("
+                SELECT user_id, DATE(punch_time) as p_date, punch_time 
+                FROM attendance_punches 
+                WHERE MONTH(punch_time) = ? AND YEAR(punch_time) = ?
+                ORDER BY punch_time ASC
+            ");
+            $punches_stmt->execute([$month, $year]);
+            $all_punches = $punches_stmt->fetchAll();
+
+            // 3. Initialize Grid with 'A' (Absent) for every day
+            $attendance_grid = [];
+            $daysInMonth = cal_days_in_month(CAL_GREGORIAN, $month, $year);
+            
+            foreach($staff as $s) {
+                $attendance_grid[$s['id']] = [
+                    'name' => $s['name'], 
+                    'department' => $s['department'], 
+                    'target_hours' => $s['standard_shift_hours'] ?? 9,
+                    'week_off' => $s['week_off_day'],
+                    'totals' => ['F' => 0, 'H' => 0, 'A' => 0, 'M' => 0],
+                    'days' => []
+                ];
+                for($d = 1; $d <= $daysInMonth; $d++) {
+                    $dt = sprintf("%04d-%02d-%02d", $year, $month, $d);
+                    $attendance_grid[$s['id']]['days'][$dt] = ['status' => 'A', 'hours' => 0]; // Default Absent
+                }
+            }
+
+            // 4. Map Punches to Users and Dates
+            $user_punches = [];
+            foreach($all_punches as $p) {
+                $uid = $p['user_id'];
+                $dt = $p['p_date'];
+                if(!isset($user_punches[$uid])) $user_punches[$uid] = [];
+                if(!isset($user_punches[$uid][$dt])) $user_punches[$uid][$dt] = [];
+                $user_punches[$uid][$dt][] = $p['punch_time'];
+            }
+
+            // 5. Mathematical F/H/A Engine
+            foreach($user_punches as $uid => $dates) {
+                if(!isset($attendance_grid[$uid])) continue;
+                $target = (float)$attendance_grid[$uid]['target_hours'];
+                
+                foreach($dates as $dt => $punches) {
+                    if (count($punches) > 1) {
+                        $first = strtotime(min($punches));
+                        $last = strtotime(max($punches));
+                        $hours = ($last - $first) / 3600;
+                        
+                        // F/H/A Logic Rules
+                        if ($hours >= ($target - 0.5)) { // 30 min grace period for full day
+                            $status = 'F';
+                            $attendance_grid[$uid]['totals']['F']++;
+                        } elseif ($hours >= ($target / 2)) {
+                            $status = 'H';
+                            $attendance_grid[$uid]['totals']['H']++;
+                        } else {
+                            $status = 'A';
+                            $attendance_grid[$uid]['totals']['A']++;
+                        }
+                        $attendance_grid[$uid]['days'][$dt] = ['status' => $status, 'hours' => round($hours, 1)];
+                    } elseif (count($punches) == 1) {
+                        // Missed punch-out
+                        $attendance_grid[$uid]['days'][$dt] = ['status' => 'M', 'hours' => 0];
+                        $attendance_grid[$uid]['totals']['M']++;
+                    }
+                }
+            }
+            
+            // Note: In Phase 4, we will check the 'Week Off' string against the current day to auto-mark W/O instead of A.
+
+            echo json_encode(['status' => 'success', 'data' => array_values($attendance_grid), 'days_in_month' => $daysInMonth]);
+        } catch(PDOException $e) { echo json_encode(['status' => 'error', 'message' => 'Failed to generate spreadsheet.']); }
+        break;
+
+
+    // --- (Keeping Terminal and Dashboard API identical) ---
+    case 'get_payroll_data':
+        $branch_id = $request['branch_id'] ?? null; $month = $request['month'] ?? date('m'); $year = $request['year'] ?? date('Y');
+        if(!$branch_id) { echo json_encode(['status' => 'error', 'message' => 'Branch ID required.']); exit; }
+        try {
+            $stmt = $pdo->prepare("SELECT u.id, u.name, u.role, c.monthly_fixed_salary FROM users u LEFT JOIN employee_contracts c ON u.id = c.user_id WHERE u.branch_id = ? AND u.status = 'active' ORDER BY u.name ASC");
+            $stmt->execute([$branch_id]);
+            $staff = $stmt->fetchAll();
+            $attendance_stmt = $pdo->prepare("SELECT user_id, COUNT(DISTINCT DATE(punch_time)) as days_worked FROM attendance_punches WHERE MONTH(punch_time) = ? AND YEAR(punch_time) = ? GROUP BY user_id");
+            $attendance_stmt->execute([$month, $year]);
+            $attendance_counts = [];
+            while ($row = $attendance_stmt->fetch()) { $attendance_counts[$row['user_id']] = $row['days_worked']; }
+            $payroll_data = [];
+            foreach ($staff as $s) {
+                $s['days_worked'] = $attendance_counts[$s['id']] ?? 0;
+                $s['paid_leaves'] = 0; $s['advance_deduction'] = 0; $s['shop_bill'] = 0;
+                $payroll_data[] = $s;
+            }
+            echo json_encode(['status' => 'success', 'data' => $payroll_data]);
+        } catch(PDOException $e) { echo json_encode(['status' => 'error', 'message' => 'Failed to generate payroll data.']); }
         break;
 
     case 'get_branch_staff':
@@ -134,71 +291,19 @@ switch ($action) {
             $staff_stmt = $pdo->prepare("SELECT u.id, u.name, u.role, c.standard_shift_hours FROM users u LEFT JOIN employee_contracts c ON u.id = c.user_id WHERE u.branch_id = ? AND u.status = 'active' ORDER BY u.name ASC");
             $staff_stmt->execute([$branch_id]);
             $staff_list = $staff_stmt->fetchAll();
-
             $punches_stmt = $pdo->prepare("SELECT p.user_id, p.punch_time FROM attendance_punches p JOIN users u ON p.user_id = u.id WHERE u.branch_id = ? AND DATE(p.punch_time) = ? ORDER BY p.punch_time ASC");
             $punches_stmt->execute([$branch_id, $date]);
             $all_punches = $punches_stmt->fetchAll();
-
             $dashboard_data = [];
             foreach ($staff_list as $staff) {
                 $staff['punches'] = [];
                 foreach ($all_punches as $punch) {
-                    if ($punch['user_id'] == $staff['id']) $staff['punches'][] = $punch['punch_time'];
+                    if ($punch['user_id'] == $staff['id']) { $staff['punches'][] = $punch['punch_time']; }
                 }
                 $dashboard_data[] = $staff;
             }
             echo json_encode(['status' => 'success', 'data' => $dashboard_data]);
         } catch(PDOException $e) { echo json_encode(['status' => 'error', 'message' => 'Failed to fetch timeline data.']); }
-        break;
-
-    // --- NEW: PAYROLL ENGINE ENDPOINTS ---
-    case 'get_payroll_data':
-        $branch_id = $request['branch_id'] ?? null;
-        $month = $request['month'] ?? date('m');
-        $year = $request['year'] ?? date('Y');
-        
-        if(!$branch_id) { echo json_encode(['status' => 'error', 'message' => 'Branch ID required.']); exit; }
-
-        try {
-            // Get all staff and their contracts
-            $stmt = $pdo->prepare("
-                SELECT u.id, u.name, u.role, c.monthly_fixed_salary 
-                FROM users u 
-                LEFT JOIN employee_contracts c ON u.id = c.user_id 
-                WHERE u.branch_id = ? AND u.status = 'active'
-                ORDER BY u.name ASC
-            ");
-            $stmt->execute([$branch_id]);
-            $staff = $stmt->fetchAll();
-
-            // Calculate distinct days punched for the given month
-            $attendance_stmt = $pdo->prepare("
-                SELECT user_id, COUNT(DISTINCT DATE(punch_time)) as days_worked 
-                FROM attendance_punches 
-                WHERE MONTH(punch_time) = ? AND YEAR(punch_time) = ? 
-                GROUP BY user_id
-            ");
-            $attendance_stmt->execute([$month, $year]);
-            $attendance_counts = [];
-            while ($row = $attendance_stmt->fetch()) {
-                $attendance_counts[$row['user_id']] = $row['days_worked'];
-            }
-
-            // Map the data together
-            $payroll_data = [];
-            foreach ($staff as $s) {
-                $s['days_worked'] = $attendance_counts[$s['id']] ?? 0;
-                // Default temporary fields for the UI calculation
-                $s['paid_leaves'] = 0;
-                $s['advance_deduction'] = 0;
-                $s['shop_bill'] = 0;
-                $payroll_data[] = $s;
-            }
-
-            echo json_encode(['status' => 'success', 'data' => $payroll_data]);
-        } catch(PDOException $e) { 
-            echo json_encode(['status' => 'error', 'message' => 'Failed to generate payroll data.']); 
-        }
         break;
 
     default: http_response_code(400); echo json_encode(['status' => 'error', 'message' => 'Invalid action.']); break;
