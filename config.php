@@ -1,15 +1,10 @@
 <?php
-// config.php - Database Connection
-// NOTE FOR HOSTINGER DEPLOYMENT:
-// Change DB_USER, DB_PASS, DB_NAME to your Hostinger MySQL credentials.
-// Remove the 'debug' line from the catch block before going live.
-
 date_default_timezone_set('Asia/Kolkata');
 
 define('DB_HOST', 'localhost');
 define('DB_USER', 'root');       // Hostinger: your DB username
 define('DB_PASS', '');           // Hostinger: your DB password
-define('DB_NAME', 'caketown_vault'); // Hostinger: your DB name
+define('DB_NAME', 'caketown_v2');
 
 try {
     $pdo = new PDO(
